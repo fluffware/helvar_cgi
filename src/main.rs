@@ -10,12 +10,18 @@ use tokio::sync::Mutex;
 use std::sync::Mutex as StdMutex;
 use std::fmt;
 use std::convert::TryFrom;
+use std::convert::TryInto;
+use std::str::FromStr;
 
 extern crate helvar_cgi;
 use helvar_cgi::fast_cgi::decoder::Decoder;
 
 #[macro_use]
 extern crate async_trait;
+
+#[macro_use]
+extern crate serde_json;
+use serde_json as json;
 
 pub mod helvar_error;
 use helvar_error::HelvarError;
@@ -25,6 +31,12 @@ pub mod dali_state;
 use dali_state::RouterState;
 use dali_state::SubnetState;
 use dali_state::DeviceState;
+
+pub mod helvar_device_type;
+use helvar_device_type::HelvarDeviceType;
+
+pub mod wrapper_error;
+use wrapper_error::WrapperError;
 
 use helvar_cgi::fast_cgi as fcgi;
 use fcgi::input_stream::RecordInputStream;
@@ -56,7 +68,16 @@ impl Router {
                 self.addr[0],self.addr[1],self.addr[2],self.addr[3], 
                 subnet,dev)
     }
-
+    
+    async fn command(&mut self, cmd_str: &str) -> Result<(),HelvarError>
+    {
+        let cmd_bytes = cmd_str.as_bytes();
+        match self.stream.write(cmd_bytes).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into())
+        }
+    }
+    
     async fn query(&mut self, cmd_str: &str) -> Result<String,HelvarError>
     {
         let cmd_bytes = cmd_str.as_bytes();
@@ -147,24 +168,45 @@ impl Router {
         };
         Ok(t)
     }
-   
+
+    async fn set_direct_level_device(&mut self, subnet: u8, dev: u8,
+                                     level: u32, fade: u32) 
+                                     -> Result<(),HelvarError>
+    {
+        let cmd_str = format!("?V:{},C:{},L:{},F:{},{}#",
+                              self.helvarnet_version, 
+                              cmd::CMD_DIRECT_LEVEL_DEVICE,
+                              level, fade,
+                              self.device_arg(subnet, dev));
+        self.command(&cmd_str).await
+    }
 }
 
 struct Handler
 {
-    count: u32
+    router_state: RouterStateArc,
+    router_control: RouterArc
 }
 
 struct HandlerError
 {
-    msg: String
+    msg: String,
+    src: Option<Box<dyn std::error::Error + Send + 'static>>
 }
 
 impl HandlerError
 {
     fn new(msg: &str) -> HandlerError
     {
-        HandlerError{msg: msg.to_string()}
+        HandlerError{msg: msg.to_string(),
+                     src: None}
+    }
+
+    fn from_error<E>(err: E, msg: &str) -> HandlerError
+        where E: std::error::Error + Send + 'static
+    {
+        HandlerError{msg: msg.to_string(),
+                     src: Some(Box::new(err))}
     }
 }
 
@@ -176,7 +218,11 @@ impl fmt::Display for HandlerError
 {
      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result
     {
-        f.write_str(&self.msg)
+        if let Some(src) = &self.src {
+            write!(f,"{}: {}", &self.msg, src)
+        } else {
+            f.write_str(&self.msg)
+        }
     }
 }
 
@@ -184,124 +230,298 @@ impl fmt::Debug for HandlerError
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result
     {
-        write!(f,"HandlerError: {}", self.msg)
+        if let Some(src) = &self.src {
+            write!(f,"HandlerError: {}: {}", &self.msg, src)
+        } else {
+             write!(f,"HandlerError: {}", self.msg)
+        }
     }
 }
+
+fn device_to_json(dev: &DeviceState) -> json::Value
+{
+    json::json!({"description": dev.description,
+                 "address": dev.address,
+                 "level": dev.intensity})
+}
+
+fn subnet_to_json(sn: &SubnetState) -> json::Value
+{
+    let mut dev_map = json::map::Map::new();
+    let mut dev_iter = (1..64).map(|x| &sn.devices[x-1])
+        .filter_map(|x| x.as_ref())
+        .peekable();
+    while let Some(dev) = dev_iter.next() {
+        dev_map.insert(dev.address.to_string(), 
+                       device_to_json(dev));
+    }
+    
+    json::json!({"devices": json!(dev_map),
+                 "index": json!(sn.index)})
+}
+
 
 #[async_trait]
 impl RequestHandler for Handler 
 {
     async fn handle(&mut self, req: &Request) -> Result<String, Box<dyn std::error::Error + Send>>
     {
-        //return Err(Box::new(HandlerError::new("Failed")));
-        println!("Rec: {:?}", req);
-        self.count+= 1;
-        let mut reply = "Content-type: text/html\r\n\r\n".to_string();
-        reply += "<html><head><title>Response</title></head>\r\n";
-        reply += "<body><h1>Response</h1>";
-        reply += &format!("<p>Count: {}</p>",self.count);
-        if let Some(stdin) = &req.stdin {
-            reply += &format!("<p>Stdin: {}</p>",
-                              String::from_utf8(stdin.to_vec()).unwrap());
+        let mut subnet_arg = None::<u32>;
+        let mut address_arg = None::<u32>;
+        if let Some(path) = req.params.get("PATH_INFO") {
+            let mut parts = path.split("/");
+            let subnet_str =
+                parts.next()
+                .and_then(|p| if p.is_empty() {None} else {Some(p)})
+                .or_else(|| parts.next());
+            if let Some(subnet_str) = subnet_str {
+                subnet_arg = match u32::from_str(subnet_str)
+                {
+                    Ok(i) => Some(i),
+                    Err(e) => return Err(Box::new(HandlerError::from_error(
+                        e, "Failed to parse subnet index")))
+                };
+                let address_str = parts.next();
+                if let Some(address_str) = address_str {
+                    address_arg = match u32::from_str(address_str)
+                    {
+                        Ok(i) => Some(i),
+                        Err(e) => return Err(Box::new(HandlerError::from_error(
+                            e,"Failed to parse address")))
+                    };
+                }
+            }
+                    
         }
-        reply += "</body><html>";
+        println!("{:?}.{:?}", subnet_arg, address_arg);
+
+        if let Some(query_str) = req.params.get("QUERY_STRING") {
+            if query_str.starts_with("level=") {
+                match u8::from_str(&query_str[6..]) {
+                    Ok(level) => {
+                        if let (Some(sn_index), Some(addr)) =
+                            (subnet_arg, address_arg)
+                        {
+                            println!("Set level {}.{}: {}",sn_index, addr, level);
+                            let mut router = self.router_control.lock().await;
+                            match router.set_direct_level_device(
+                                sn_index.try_into().unwrap(),
+                                addr.try_into().unwrap(),
+                                level.into(), 70).await {
+                                Ok(_) => {},
+                                Err(e) => {
+                                    return Err(Box::new(
+                                        HandlerError::from_error(
+                                            e,"Failed to set device level")))
+                                }
+                            }
+                            let mut rs = self.router_state.lock().unwrap();
+                            if let Some(dev) = rs.get_device_mut(sn_index, addr) {
+                                dev.intensity = level;
+                            }
+
+                        }
+                    }
+                    Err(e) => return Err(Box::new(
+                        HandlerError::from_error(
+                            e,"Failed to parse level")))
+                }
+            }
+        }
+        let rs = self.router_state.lock().unwrap();
+        let mut reply = "Content-type: application/json\r\n\r\n".to_string();
+
+        let top_obj = match (subnet_arg, address_arg) {
+            (Some(subnet), Some(addr)) => {
+                if let Some(dev) = rs.get_device(subnet, addr) {
+                    device_to_json(dev)
+                } else {
+                    json::Value::Null
+                }
+            },
+            (Some(subnet), None) => {
+                if let Some(sn) = rs.get_subnet(subnet) {
+                    subnet_to_json(&sn)
+                } else {
+                    json::Value::Null
+                } 
+            },
+            (None, _) => {
+                let mut subnet_map = serde_json::map::Map::new();
+                
+                let mut sn_iter = 
+                    rs.subnets.iter()
+                    .filter_map(|x| x.as_ref())
+                    .peekable();
+                while let Some(sn) = sn_iter.next() {
+                    
+            
+                    subnet_map.insert(sn.index.to_string(), 
+                                      subnet_to_json(sn));
+                    
+                }
+                json!({"subnets": json!(subnet_map)})
+            }
+        };
+        reply += &serde_json::to_string_pretty(&top_obj).unwrap();
         Ok(reply)
     }
 }
 
-async fn connection_handler<S>(stream: Arc<Mutex<Box<S>>>)
+type RouterStateArc = Arc<StdMutex<RouterState>>;
+type RouterArc = Arc<Mutex<Router>>;
+
+async fn connection_handler<S>(stream: Arc<Mutex<Box<S>>>, 
+                               router_state: RouterStateArc,
+                               router_control: RouterArc)
     where S: AsyncRead+AsyncWrite+Unpin+Send+'static
 {
     let rec_stream = RecordInputStream::new(stream.clone());
     let rec_output = RecordOutput::new(stream);
     let mut decoder = Decoder::new();
-    decoder.run(rec_stream,rec_output, &mut Handler{count: 29}).await;
+    decoder.run(rec_stream,rec_output, 
+                &mut Handler{router_state, router_control}).await;
 }
 
-#[tokio::main]
-async fn main() {
-
-    let router_state = Arc::new(StdMutex::new(RouterState::new()));
-    let fcgi = tokio::spawn(async {
-        let std_listener = unsafe {
-            std::os::unix::net::UnixListener::from_raw_fd(0)
-        };
-        let mut listener = 
-            tokio::net::UnixListener::from_std(std_listener).unwrap();
-        let mut incoming = listener.incoming();
-        
-        println!("Listening");
-        while let Some(stream) = incoming.next().await {
-            match stream {
-                Ok(stream) => {
-                
-                    let io = Arc::new(Mutex::new(Box::new(stream)));
-                tokio::spawn(connection_handler(io));
+async fn query_device(router: &mut Router, router_state: &RouterStateArc,
+                      subnet: u8, addr: u8, priority: u32)
+                      -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut dev = {
+        let rs = router_state.lock().unwrap();
+        rs.subnets.get(usize::from(subnet) -1).and_then({
+            |sn| match sn {
+                Some(sn) => sn.devices[usize::from(addr)-1].clone(),
+                None => None
+            }
+        }).unwrap_or_else(|| Box::new(DeviceState::new()))
+    };
+    dev.address = u32::from(addr);
+    'done: loop {
+        match router.query_device_type(subnet,addr).await {
+            Ok(dtype) => {
+                dev.device_type = dtype;
+            },
+            Err(HelvarError::NoSuchDevice) => return Ok(()),
+            Err(e) => {
+                return Err(WrapperError::new("Failed to query device type",
+                                             Box::new(e)).into());
+            }
+        }
+        if HelvarDeviceType::from(dev.device_type).is_load() { 
+            match router.query_load_level(subnet,addr).await {
+                Ok(level) => {
+                    dev.intensity = u8::try_from(level).unwrap_or(0xff);
                 },
+                Err(HelvarError::NoSuchDevice) => return Ok(()),
                 Err(e) => {
-                    println!("Error: {:?}", e);
+                    return Err(WrapperError::new("Failed to query load level",
+                                                 Box::new(e)).into());
                 }
             }
         }
-        println!("Stopped");
-    });
+        if priority > 1 {break 'done}
+        match router.query_device_description(subnet,addr).await {
+            Ok(descr) => {
+                dev.description = descr;
+            },
+            Err(e) => {
+                return Err(WrapperError::new("Failed to query device description",
+                                             Box::new(e)).into());
+            }
+        }
+        break
+    }
+    
+    let mut rs = router_state.lock().unwrap();
+    while rs.subnets.len() <= subnet.into() {
+        rs.subnets.push(None);
+    }
+    let sn = rs.subnets[usize::from(subnet) -1]
+        .get_or_insert_with(
+            || Box::new(SubnetState::new(u32::from(subnet))));
+    sn.devices[usize::from(addr)-1] = Some(dev);
+    
+    Ok(())
+}
 
-    let helvar = tokio::spawn(async move {
-        let mut router = Router::connect(&[172,16,120,98]).await.unwrap();
+async fn fcgi_task(router: RouterArc, router_state:RouterStateArc)
+{
+    let std_listener = unsafe {
+        std::os::unix::net::UnixListener::from_raw_fd(0)
+    };
+    let mut listener = 
+        tokio::net::UnixListener::from_std(std_listener).unwrap();
+    let mut incoming = listener.incoming();
+    
+    println!("Listening");
+    while let Some(stream) = incoming.next().await {
+        match stream {
+            Ok(stream) => {
+                
+                let io = Arc::new(Mutex::new(Box::new(stream)));
+                tokio::spawn(connection_handler(io,
+                                                router_state.clone(),
+                                                router.clone()));
+            },
+            Err(e) => {
+                println!("Error: {:?}", e);
+            }
+        }
+    }
+    println!("Stopped");
+}
+
+async fn router_poll_task(router: RouterArc, router_state:RouterStateArc)
+{
+      
         for subnet in 1..=2 {
             for a in 1..=64 {
-                let mut dev = Box::new(DeviceState::new());
-                dev.address = u32::from(a);
-                match router.query_device_type(subnet,a).await {
-                    Ok(dtype) => {
-                        dev.device_type = dtype;
-                    },
-                    Err(e) => {
-                        println!("{} Error: {}", a,e);
-                        continue;
-                    }
+                let mut router = router.lock().await;
+                match query_device(&mut router, &router_state,
+                                   subnet, a, 0).await
+                {
+                    Ok(()) => {},
+                    Err(e) => eprintln!("Initial query failed: {}",e)
                 }
-                match router.query_device_description(subnet,a).await {
-                    Ok(descr) => {
-                        dev.description = descr;
-                    },
-                    Err(e) => {
-                        println!("{} Error: {}", a,e);
-                        continue
-                    }
-                }
-                
-                match router.query_load_level(subnet,a).await {
-                    Ok(level) => {
-                        dev.intensity = u8::try_from(level).unwrap_or(0xff);
-                    },
-                    Err(e) => {
-                        println!("{} Error: {}", a,e);
-                        continue
-                    }
-                }
-
-                let mut rs = router_state.lock().unwrap();
-                while rs.subnets.len() <= subnet.into() {
-                    rs.subnets.push(None);
-                }
-                let sn = rs.subnets[usize::from(subnet) -1]
-                    .get_or_insert_with(
-                        || Box::new(SubnetState::new()));
-                sn.devices[usize::from(a)-1] = Some(dev);
-                
             }
         }
         {
             let rs = router_state.lock();
             println!("{:?}", rs);
         }
-        /*    ;
-    stream.write(b"?V:3,C:106,@172.16.120.98.1.12#").await.unwrap();
-            let n = stream.read(&mut buf).await.unwrap();
-            println!("{} {}",n, std::str::from_utf8(&buf[0..n]).unwrap());
-         */
-    });
+        loop {
+            for subnet in 1..=2 {
+                for a in 1..=64 {
+                    {
+                        let mut router = router.lock().await;
+                        match query_device(&mut router, &router_state,
+                                           subnet, a, 0).await
+                        {
+                            Ok(()) => {},
+                            Err(e) => eprintln!("Update query failed: {}",e)
+                        }
+                    }
+                    tokio::time::delay_for(Duration::from_secs(1)).await;
+                println!("Updating {}",a);
+                }
+            }
+        }
+}
+
+#[tokio::main]
+async fn main() {
+
+    let router_state = Arc::new(StdMutex::new(RouterState::new()));
+    let router = Router::connect(&[172,16,120,98]).await.unwrap();
+    let router = Arc::new(tokio::sync::Mutex::new(router));
+    
+    let fcgi = tokio::spawn(fcgi_task(router.clone(),
+                                      router_state.clone()));
+    
+    let helvar = tokio::spawn(router_poll_task(router.clone(),
+                                               router_state.clone()));
+                              
     fcgi.await.unwrap();
     helvar.await.unwrap();
 }
