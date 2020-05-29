@@ -293,7 +293,7 @@ impl RequestHandler for Handler
             }
                     
         }
-        println!("{:?}.{:?}", subnet_arg, address_arg);
+	
 
         if let Some(query_str) = req.params.get("QUERY_STRING") {
             if query_str.starts_with("level=") {
@@ -302,7 +302,7 @@ impl RequestHandler for Handler
                         if let (Some(sn_index), Some(addr)) =
                             (subnet_arg, address_arg)
                         {
-                            println!("Set level {}.{}: {}",sn_index, addr, level);
+                            // println!("Set level {}.{}: {}",sn_index, addr, level);
                             let mut router = self.router_control.lock().await;
                             match router.set_direct_level_device(
                                 sn_index.try_into().unwrap(),
@@ -454,7 +454,7 @@ async fn fcgi_task(router: RouterArc, router_state:RouterStateArc)
         tokio::net::UnixListener::from_std(std_listener).unwrap();
     let mut incoming = listener.incoming();
     
-    println!("Listening");
+    //println!("Listening");
     while let Some(stream) = incoming.next().await {
         match stream {
             Ok(stream) => {
@@ -469,7 +469,7 @@ async fn fcgi_task(router: RouterArc, router_state:RouterStateArc)
             }
         }
     }
-    println!("Stopped");
+    //println!("Stopped");
 }
 
 async fn router_poll_task(router: RouterArc, router_state:RouterStateArc)
@@ -487,8 +487,8 @@ async fn router_poll_task(router: RouterArc, router_state:RouterStateArc)
             }
         }
         {
-            let rs = router_state.lock();
-            println!("{:?}", rs);
+            //let rs = router_state.lock();
+            //println!("{:?}", rs);
         }
         loop {
             for subnet in 1..=2 {
@@ -503,7 +503,7 @@ async fn router_poll_task(router: RouterArc, router_state:RouterStateArc)
                         }
                     }
                     tokio::time::delay_for(Duration::from_secs(1)).await;
-                println!("Updating {}",a);
+                    //println!("Updating {}",a);
                 }
             }
         }

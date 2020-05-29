@@ -72,7 +72,7 @@ impl Decoder
             } else {
                 match ServerRecord::decode(&rec) {
                     Ok(ServerRecord::BeginRequest(begin)) => {
-                        println!("Begin: {:?}", begin);
+                        //println!("Begin: {:?}", begin);
                         let params = BTreeMap::new();
                         self.requests.insert(rec.request_id, 
                                              Request{
@@ -161,7 +161,7 @@ impl Decoder
                                         protocol_status: defs::FCGI_REQUEST_COMPLETE
                                     });
                                 output.write(&reply.encode(rec.request_id).unwrap()).await.unwrap_or(());
-                                println!("Request done");
+                                //println!("Request done");
                             },
                             Err(e) => {
                                 Self::error_reply(&mut output, e, rec.request_id).await;
@@ -172,7 +172,7 @@ impl Decoder
                 }
             }
         }
-        println!("Connection closed");
+        //println!("Connection closed");
     }
 }
 
