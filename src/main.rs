@@ -2,16 +2,18 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
 use tokio;
 use tokio::prelude::*;
+use tokio::stream::StreamExt;
+use tokio::sync::Mutex;
 use std::time::Duration;
 use std::os::unix::io::FromRawFd;
-use tokio::stream::StreamExt;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::sync::Mutex as StdMutex;
 use std::fmt;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::str::FromStr;
+use std::net::Ipv4Addr;
+use std::env;
 
 extern crate helvar_cgi;
 use helvar_cgi::fast_cgi::decoder::Decoder;
@@ -45,17 +47,15 @@ use fcgi::record_output::RecordOutput;
 use fcgi::request::{Request,RequestHandler};
     
 struct Router {
-    addr: [u8;4],
+    addr: Ipv4Addr,
     stream: TcpStream,
     helvarnet_version: u32
 }
 
 impl Router {
-    async fn connect(addr: &[u8;4]) -> Result<Router,HelvarError>
+    async fn connect(addr: &Ipv4Addr) -> Result<Router,HelvarError>
     {
-        let ip_addr = 
-            IpAddr::V4((*addr).into());
-        let socket = SocketAddr::new(ip_addr,50000);
+        let socket = SocketAddr::new(IpAddr::V4(addr.clone()),50000);
         let stream = TcpStream::connect(socket).await?;
 
         let router = Router{addr: addr.clone(), stream, helvarnet_version: 3};
@@ -64,9 +64,7 @@ impl Router {
 
     fn device_arg(&self, subnet: u8, dev: u8) -> String
     {
-        format!("@{}.{}.{}.{}.{}.{}",
-                self.addr[0],self.addr[1],self.addr[2],self.addr[3], 
-                subnet,dev)
+        format!("@{}.{}.{}", self.addr, subnet,dev)
     }
     
     async fn command(&mut self, cmd_str: &str) -> Result<(),HelvarError>
@@ -511,9 +509,24 @@ async fn router_poll_task(router: RouterArc, router_state:RouterStateArc)
 
 #[tokio::main]
 async fn main() {
-
+    
+    let addr_str = match env::var("ROUTER_ADDRESS")
+    {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("No environment variable ROUTER_ADDRESS found");
+            return;
+        }
+    };
+    let addr = match Ipv4Addr::from_str(&addr_str) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Invalid router address: {}", e);
+            return;
+        }
+    };
     let router_state = Arc::new(StdMutex::new(RouterState::new()));
-    let router = Router::connect(&[172,16,120,98]).await.unwrap();
+    let router = Router::connect(&addr).await.unwrap();
     let router = Arc::new(tokio::sync::Mutex::new(router));
     
     let fcgi = tokio::spawn(fcgi_task(router.clone(),

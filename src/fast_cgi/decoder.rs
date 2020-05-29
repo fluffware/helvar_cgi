@@ -73,14 +73,24 @@ impl Decoder
                 match ServerRecord::decode(&rec) {
                     Ok(ServerRecord::BeginRequest(begin)) => {
                         //println!("Begin: {:?}", begin);
-                        let params = BTreeMap::new();
-                        self.requests.insert(rec.request_id, 
-                                             Request{
-                                                 params,
-                                                 stdin: None,
-                                                 input_left: 0,
-                                                 request_done: false
-                                             });
+                        if begin.role !=defs::FCGI_RESPONDER {
+                            let end_rec = EndRequest{
+                                protocol_status: defs::FCGI_UNKNOWN_ROLE,
+                                app_status: 0
+                            };
+                            let end = AppRecord::EndRequest(end_rec);
+                            output.write(&end.encode(rec.request_id).unwrap())
+                                .await.unwrap_or(());
+                        } else {
+                            let params = BTreeMap::new();
+                            self.requests.insert(rec.request_id, 
+                                                 Request{
+                                                     params,
+                                                     stdin: None,
+                                                     input_left: 0,
+                                                     request_done: false
+                                                 });
+                        }
                     },
                     Ok(ServerRecord::Params(pairs)) => {
                         if let Some(request) = 
@@ -142,7 +152,7 @@ impl Decoder
 
                     }
                     Err(e) => {
-                        println!("Failed to decode record: {}", e);
+                        eprintln!("Failed to decode record: {}", e);
                     }
                     
                 }
@@ -162,6 +172,7 @@ impl Decoder
                                     });
                                 output.write(&reply.encode(rec.request_id).unwrap()).await.unwrap_or(());
                                 //println!("Request done");
+                                self.requests.remove(&rec.request_id);
                             },
                             Err(e) => {
                                 Self::error_reply(&mut output, e, rec.request_id).await;
